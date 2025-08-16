@@ -1,0 +1,199 @@
+  1) Customers with an open card (active accounts only)
+   ------------------------------------------------------------ */
+drop table CUST_OPEN_CARD purge;
+
+create table CUST_OPEN_CARD as
+select
+    a.CUSTOMER_ID        as CUSTOMER_ID,     
+    a.CARD_ACCT_ID       as CARD_ACCT_ID,    
+    a.CARD_STATUS        as CARD_STATUS,      
+    a.E_STATEMENT_FLAG   as E_STATEMENT_FLAG, 
+    a.CARD_OPEN_DATE     as CARD_OPEN_DATE,   
+    b.APP_SOURCE_CODE    as APP_SOURCE_CODE   
+from   WAREHOUSE.DM_CARD a                     
+left join WAREHOUSE.DM_APPLICATION b            
+       on substr(a.CARD_ACCT_ID, 7, 10) = b.APP_DISPLAY_ACCT_ID
+where  a.CARD_STATUS not in ('8','9','Z')
+  and  (a.CARD_CLOSE_DATE is null or a.CARD_CLOSE_DATE > sysdate);
+
+
+/* ------------------------------------------------------------
+   2) Open-card customers who are registered for digital
+      (WEB or APP)
+   ------------------------------------------------------------ */
+drop table DIGITALLY_REGISTERED purge;
+
+create table DIGITALLY_REGISTERED as
+select distinct x.CUSTOMER_ID
+from CUST_OPEN_CARD x
+join (
+    select w.CUSTOMER_ID from WAREHOUSE.DM_WEB_LOGON  w  
+    union
+    select m.CUSTOMER_ID from WAREHOUSE.DM_APP_LOGON  m   
+) d on x.CUSTOMER_ID = d.CUSTOMER_ID;
+
+
+/* ------------------------------------------------------------
+   3) Open-card customers with a valid email
+   ------------------------------------------------------------ */
+drop table CUST_WITH_VALID_EMAIL purge;
+
+create table CUST_WITH_VALID_EMAIL as
+select distinct ca.CUSTOMER_ID
+from WAREHOUSE.DM_CUSTOMER_ADDRESS ca          
+join CUST_OPEN_CARD c
+  on ca.CUSTOMER_ID = c.CUSTOMER_ID
+where ca.EMAIL_ADDR is not null                 
+  and ca.EMAIL_ADDR like '%_@__%.__%'
+  and ca.EMAIL_ADDR <> 'no.email@address.com';
+
+
+/* ------------------------------------------------------------
+   4) Open-card customers opted in for email marketing
+   ------------------------------------------------------------ */
+drop table CUST_EMAIL_OPT_IN purge;
+
+create table CUST_EMAIL_OPT_IN as
+select c.CUSTOMER_ID
+from   CUST_OPEN_CARD c
+join   WAREHOUSE.DM_CUSTOMER p               
+  on   c.CUSTOMER_ID = p.CUSTOMER_ID
+where  p.EMAIL_OPT_IN_FLAG = 'Y';               
+
+/* ------------------------------------------------------------
+   5) Open-card customers with a valid mobile number
+   ------------------------------------------------------------ */
+drop table CUST_WITH_VALID_MOBILE purge;
+
+create table CUST_WITH_VALID_MOBILE as
+select distinct ca.CUSTOMER_ID
+from WAREHOUSE.DM_CUSTOMER_ADDRESS ca
+join CUST_OPEN_CARD c
+  on ca.CUSTOMER_ID = c.CUSTOMER_ID
+where ca.MOBILE_PHONE is not null                
+   or ca.HOME_PHONE like '07%';               
+
+
+/* ------------------------------------------------------------
+   6) APP customers (observed on mobile channel)
+   ------------------------------------------------------------ */
+drop table APP_CUSTOMERS purge;
+
+create table APP_CUSTOMERS as
+select distinct m.CUSTOMER_ID
+from WAREHOUSE.DM_MOBILE_EVENTS m               
+join CUST_OPEN_CARD c
+  on m.CUSTOMER_ID = c.CUSTOMER_ID
+where m.CHANNEL_ID not in ('WEB','OHI');
+
+
+/* ------------------------------------------------------------
+   7) WEB-only customers (seen on WEB but not APP)
+   ------------------------------------------------------------ */
+drop table WEB_ONLY_CUSTOMERS purge;
+
+create table WEB_ONLY_CUSTOMERS as
+select o.CUSTOMER_ID
+from   CUST_OPEN_CARD o
+join   WAREHOUSE.DM_WEB_LOGON w
+  on   o.CUSTOMER_ID = w.CUSTOMER_ID
+where  w.CUSTOMER_ID not in (select a.CUSTOMER_ID from APP_CUSTOMERS);
+
+
+/* ------------------------------------------------------------
+   8) Product-active cards in the last 12 months
+   ------------------------------------------------------------ */
+drop table CARD_TXN_12M purge;
+
+create table CARD_TXN_12M as
+select distinct t.CARD_ACCT_ID
+from WAREHOUSE.DM_CARD_TXN t                     
+where t.TXN_LOAD_DATE > add_months(next_day(sysdate,'SATURDAY')-7,-12)  
+  and t.TXN_LOAD_DATE <=           next_day(sysdate,'SATURDAY')-7;
+
+
+drop table ACTIVE_OPEN_CARD_12M purge;
+
+create table ACTIVE_OPEN_CARD_12M as
+select /*+ parallel(a) parallel(b) use_hash(a b) */ distinct a.CUSTOMER_ID
+from   CUST_OPEN_CARD a
+join   CARD_TXN_12M   b
+  on   a.CARD_ACCT_ID = b.CARD_ACCT_ID;
+
+
+/* ============================================================
+   METRICS
+   ============================================================ */
+
+/* ------------------------------------------------------------
+   A) 12-month product-active, open-card customers who have
+      valid email AND are opted into email marketing,
+      but have NEVER registered for digital
+   ------------------------------------------------------------ */
+-- Count of eligible customers
+select count(distinct e.CUSTOMER_ID) as CNT_ELIGIBLE
+from   CUST_WITH_VALID_EMAIL   e
+join   CUST_EMAIL_OPT_IN       m  on e.CUSTOMER_ID = m.CUSTOMER_ID
+join   ACTIVE_OPEN_CARD_12M    a  on m.CUSTOMER_ID = a.CUSTOMER_ID
+where  e.CUSTOMER_ID not in (select d.CUSTOMER_ID from DIGITALLY_REGISTERED d);
+
+-- Of the above, how many are missing a valid mobile number
+select count(distinct e.CUSTOMER_ID) as CNT_ELIGIBLE_MISSING_MOBILE
+from   CUST_WITH_VALID_EMAIL   e
+join   CUST_EMAIL_OPT_IN       m  on e.CUSTOMER_ID = m.CUSTOMER_ID
+join   ACTIVE_OPEN_CARD_12M    a  on m.CUSTOMER_ID = a.CUSTOMER_ID
+where  e.CUSTOMER_ID not in (select d.CUSTOMER_ID from DIGITALLY_REGISTERED d)
+  and  e.CUSTOMER_ID not in (select k.CUSTOMER_ID from CUST_WITH_VALID_MOBILE k);
+
+
+/* ------------------------------------------------------------
+   B) 12-month product-active, open-card customers who are
+      WEB-ONLY; have valid email; and are opted into email
+      marketing; plus those missing a mobile number
+   ------------------------------------------------------------ */
+-- Count of WEB-only with valid email + opt-in
+select count(distinct w.CUSTOMER_ID) as CNT_WEB_ONLY_EMAIL_OPTIN
+from   WEB_ONLY_CUSTOMERS      w
+join   CUST_EMAIL_OPT_IN       m  on w.CUSTOMER_ID = m.CUSTOMER_ID
+join   CUST_WITH_VALID_EMAIL   e  on m.CUSTOMER_ID = e.CUSTOMER_ID
+join   ACTIVE_OPEN_CARD_12M    a  on e.CUSTOMER_ID = a.CUSTOMER_ID;
+
+-- Of the above, missing a valid mobile number
+select count(distinct w.CUSTOMER_ID) as CNT_WEB_ONLY_EMAIL_OPTIN_MISSING_MOBILE
+from   WEB_ONLY_CUSTOMERS      w
+join   CUST_EMAIL_OPT_IN       m  on w.CUSTOMER_ID = m.CUSTOMER_ID
+join   CUST_WITH_VALID_EMAIL   e  on m.CUSTOMER_ID = e.CUSTOMER_ID
+join   ACTIVE_OPEN_CARD_12M    a  on e.CUSTOMER_ID = a.CUSTOMER_ID
+where  w.CUSTOMER_ID not in (select k.CUSTOMER_ID from CUST_WITH_VALID_MOBILE k);
+
+
+/* ------------------------------------------------------------
+   C) WEB-only; NO valid email; 90-day WEB-active; opted into
+      marketing; and product-active in last 12 months — plus
+      the subset missing a mobile
+   ------------------------------------------------------------ */
+drop table WEB_ACTIVE_90D purge;
+
+create table WEB_ACTIVE_90D as
+select c.CUSTOMER_ID
+from   CUST_OPEN_CARD c
+join   WAREHOUSE.DM_WEB_EVENTS we                 -- was DM_ECOMMERCE_MIA
+  on   c.CUSTOMER_ID = we.CUSTOMER_ID
+where  we.WEB_ACTION_DATE >= sysdate - 90;        -- was EC_ACTION_DATE
+
+-- Count: WEB-only + opt-in + WEB active 90d + product active 12m + NO valid email
+select count(distinct w.CUSTOMER_ID) as CNT_WEB_ONLY_NO_EMAIL_WEB_ACTIVE_90D
+from   WEB_ONLY_CUSTOMERS   w
+join   CUST_EMAIL_OPT_IN    m  on w.CUSTOMER_ID = m.CUSTOMER_ID
+join   WEB_ACTIVE_90D       a  on m.CUSTOMER_ID = a.CUSTOMER_ID
+join   ACTIVE_OPEN_CARD_12M p  on a.CUSTOMER_ID = p.CUSTOMER_ID
+where  w.CUSTOMER_ID not in (select e.CUSTOMER_ID from CUST_WITH_VALID_EMAIL e);
+
+-- Of the above, missing a valid mobile number
+select count(distinct w.CUSTOMER_ID) as CNT_WEB_ONLY_NO_EMAIL_WEB_ACTIVE_90D_MISSING_MOBILE
+from   WEB_ONLY_CUSTOMERS   w
+join   CUST_EMAIL_OPT_IN    m  on w.CUSTOMER_ID = m.CUSTOMER_ID
+join   WEB_ACTIVE_90D       a  on m.CUSTOMER_ID = a.CUSTOMER_ID
+join   ACTIVE_OPEN_CARD_12M p  on a.CUSTOMER_ID = p.CUSTOMER_ID
+where  w.CUSTOMER_ID not in (select e.CUSTOMER_ID from CUST_WITH_VALID_EMAIL e)
+  and  w.CUSTOMER_ID not in (select k.CUSTOMER_ID from CUST_WITH_VALID_MOBILE k);
