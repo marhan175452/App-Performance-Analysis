@@ -1,4 +1,4 @@
-# Five-Year App Anniversary Campaign — SQL KPIs
+# App Performance Campaign Analysis — SQL KPIs
 
 This repository contains an Oracle-SQL workflow that identifies engagement opportunities around a “five-year app anniversary” theme for cardholders. The logic builds clean base populations, derives channel registration/usage cohorts, and surfaces targeted counts you can lift directly into dashboards or campaign lists.
 
